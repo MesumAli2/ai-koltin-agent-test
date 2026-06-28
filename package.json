@@ -1,0 +1,10 @@
+{
+  "name": "excel-ai-adk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Excel AI add-in backend (Google ADK + Gemini). Same `npm start` workflow as the old Groq project.",
+  "scripts": {
+    "start": "./start.sh",
+    "stop": "lsof -ti:3000 | xargs kill 2>/dev/null || echo 'nothing running on port 3000'"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "excel-ai-adk",
+  "version": "unspecified",
+  "private": true,
+  "workspaces": [
+    "packages/excel-ai-adk",
+    "packages/excel-ai-adk-test",
+    "packages_imported/html-core-js/1.7.3",
+    "packages_imported/kotlin-test-js-runner/0.0.2"
+  ],
+  "devDependencies": {},
+  "dependencies": {},
+  "peerDependencies": {},
+  "optionalDependencies": {},
+  "bundledDependencies": [],
+  "resolutions": {}
+}

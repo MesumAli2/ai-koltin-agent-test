@@ -1,0 +1,10 @@
+abi_version=1.8.0
+builtins_platform=JS
+compiler_version=2.0.21
+depends=org.jetbrains.compose.html\:html-core org.jetbrains.compose.runtime\:runtime org.jetbrains.kotlinx\:kotlinx-coroutines-core org.jetbrains.kotlinx\:atomicfu org.jetbrains.compose.html\:internal-html-core-runtime org.jetbrains.kotlin\:kotlin-dom-api-compat kotlin
+ir_signature_versions=1,2
+jsOutputName=excel-ai-adk
+metadata_version=1.4.1
+serializedIrFileFingerprints=24b17t36mmfq2.3fuyian0lbx00 uuheh5uzb0o0.2ruykcm6vm2c
+serializedKlibFingerprint=2i6wx6twq9btn.2huv82nx5iysb
+unique_name=excel-ai-adk

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mesum's AI Assistant</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <style>
+    /* ---- Color palette (single source of truth) --------------------------- */
+    :root {
+      --excel-green:      #217346;
+      --excel-green-dark: #185c37;
+      --banner-from:      #1f6e44;
+      --banner-to:        #12502f;
+      --icon-from:        #5fd394;
+      --icon-to:          #1c7a49;
+      --white:            #ffffff;
+      --text:             #1a1a1a;
+      --muted:            #6b7280;
+      --border:           #e3e5e8;
+      --field-border:     #d9dbde;
+      --surface:          #f3f4f6;
+      --suggestion-hover: #f4f9f6;
+      --msg-label:        #2a2a2a;
+      --error-bg:         #fdecea;
+      --error-border:     #f5c6cb;
+      --error-text:       #c0392b;
+      --placeholder:      #9aa0a6;
+      --send-disabled:    #9bbfac;
+      --scroll-thumb:     #d4d6da;
+      --composer-divider: #ededed;
+    }
+
+    /* ---- Reset ------------------------------------------------------------ */
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: "Segoe UI", "Segoe UI Web (West European)", -apple-system,
+        BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      color: var(--text);
+      background: var(--white);
+    }
+
+    /* ---- App shell -------------------------------------------------------- */
+    .app { display: flex; flex-direction: column; height: 100vh; background: var(--white); }
+
+    /* ---- Scrollbar -------------------------------------------------------- */
+    .mesum-scroll::-webkit-scrollbar { width: 8px; }
+    .mesum-scroll::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 4px; }
+
+    /* ---- Banner ----------------------------------------------------------- */
+    .banner {
+      margin: 14px 16px 8px; border-radius: 10px; padding: 16px;
+      display: flex; align-items: center; gap: 13px;
+      background: linear-gradient(135deg, var(--banner-from) 0%, var(--banner-to) 100%);
+      box-shadow: 0 2px 10px rgba(18,80,47,0.28);
+      flex: 0 0 auto;
+    }
+    .banner-icon { flex-shrink: 0; }
+    .banner-icon-box {
+      font-size: 28px; font-weight: 700; color: var(--white);
+      width: 44px; height: 44px; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      background: linear-gradient(135deg, var(--icon-from), var(--icon-to));
+    }
+    .banner-text { flex: 1; min-width: 0; }
+    .banner-text h1 { margin: 0; font-size: 15px; font-weight: 700; color: var(--white); line-height: 1.2; }
+    .banner-text p  { margin: 2px 0 0; font-size: 12.5px; color: rgba(255,255,255,0.78); }
+    .new-chat-btn {
+      align-self: flex-start; font-size: 11px; font-weight: 600; color: var(--white);
+      background: rgba(255,255,255,0.16); border: 1px solid rgba(255,255,255,0.25);
+      padding: 3px 10px; border-radius: 20px; cursor: pointer;
+      font-family: inherit; transition: background 0.15s ease;
+    }
+    .new-chat-btn:hover { background: rgba(255,255,255,0.28); }
+
+    /* ---- Thread ----------------------------------------------------------- */
+    .thread {
+      flex: 1 1 auto; overflow-y: auto; padding: 8px 16px 4px;
+      display: flex; flex-direction: column; gap: 14px;
+    }
+
+    /* ---- Empty state ------------------------------------------------------ */
+    .empty-state { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 48px 20px 20px; }
+    .empty-title { font-size: 17px; font-weight: 700; color: var(--text); margin-bottom: 8px; }
+    .empty-sub   { font-size: 13.5px; line-height: 1.55; color: var(--muted); max-width: 300px; }
+    .suggestions { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 320px; margin-top: 26px; }
+    .suggestion  {
+      display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+      background: var(--white); border: 1px solid var(--border); border-radius: 9px;
+      padding: 11px 13px; cursor: pointer; font-family: inherit;
+      transition: border-color 0.12s, background 0.12s;
+    }
+    .suggestion:hover    { border-color: var(--excel-green); background: var(--suggestion-hover); }
+    .suggestion:disabled { opacity: 0.5; cursor: default; }
+    .sug-icon  { font-size: 16px; }
+    .sug-label { font-size: 13px; color: var(--msg-label); font-weight: 500; }
+
+    /* ---- Messages --------------------------------------------------------- */
+    .msg { max-width: 90%; padding: 10px 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }
+    .msg.user      { align-self: flex-end;  background: var(--excel-green);  color: var(--white); border-radius: 14px 14px 4px 14px; }
+    .msg.assistant { align-self: flex-start; background: var(--surface); color: var(--text);  border-radius: 14px 14px 14px 4px; }
+    .msg.error     { align-self: flex-start; background: var(--error-bg); border: 1px solid var(--error-border); color: var(--error-text); border-radius: 14px 14px 14px 4px; }
+    .msg.assistant .meta { margin-top: 7px; font-size: 11px; font-weight: 600; color: var(--excel-green-dark); }
+
+    /* ---- Thinking dots ---------------------------------------------------- */
+    .thinking-dots { align-self: flex-start; display: flex; gap: 4px; align-items: center; background: var(--surface); padding: 11px 14px; border-radius: 14px 14px 14px 4px; }
+    .thinking-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--excel-green); animation: mesumdot 1.2s infinite; }
+    .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes mesumdot {
+      0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+      40%            { opacity: 1;    transform: translateY(-3px); }
+    }
+
+    /* ---- Composer --------------------------------------------------------- */
+    .composer     { flex: 0 0 auto; padding: 12px 16px 14px; border-top: 1px solid var(--composer-divider); background: var(--white); }
+    .composer-box { border: 1.5px solid var(--field-border); border-radius: 11px; padding: 12px 14px; background: var(--white); transition: border-color 0.12s; }
+    .composer-box:focus-within { border-color: var(--excel-green); }
+    textarea#prompt {
+      width: 100%; border: none; outline: none; resize: none;
+      font-family: inherit; font-size: 13.5px; line-height: 1.5;
+      color: var(--text); background: transparent;
+    }
+    textarea#prompt::placeholder { color: var(--placeholder); }
+    .composer-row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
+    .hint { font-size: 11.5px; color: var(--placeholder); }
+    .send-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--excel-green); color: var(--white); border: none;
+      border-radius: 7px; padding: 8px 16px; font-size: 13px; font-weight: 600;
+      font-family: inherit; cursor: pointer; transition: background 0.12s;
+    }
+    .send-btn:hover    { background: var(--excel-green-dark); }
+    .send-btn:disabled { background: var(--send-disabled); cursor: default; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="taskpane.js"></script>
+</body>
+</html>
