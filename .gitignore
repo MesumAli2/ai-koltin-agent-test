@@ -1,0 +1,14 @@
+# Secrets / environment
+.env
+*.env
+**/.env
+!.env.example
+
+# Build output
+.gradle/
+build/
+**/build/
+
+# Python
+__pycache__/
+*.pyc
