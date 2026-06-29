@@ -236,11 +236,8 @@ fun App() {
 @Composable
 private fun Banner(hasKey: Boolean, onNewChat: () -> Unit, onEditKey: () -> Unit) {
     Header({ classes("banner") }) {
-        Div({ classes("banner-icon") }) {
-            Div({ classes("banner-icon-box") }) { Text("M") }
-        }
         Div({ classes("banner-text") }) {
-            H1 { Text("M-AI") }
+            H1 { Text("M 🤖") }
             P { Text("Build a sheet, then keep refining it.") }
         }
         Button({
