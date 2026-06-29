@@ -1,13 +1,48 @@
 import androidx.compose.runtime.*
 import kotlinx.browser.document
+import kotlinx.browser.localStorage
 import kotlinx.browser.window
 import kotlinx.coroutines.*
+import org.jetbrains.compose.web.attributes.*
 import org.jetbrains.compose.web.dom.*
 import org.jetbrains.compose.web.renderComposable
 import kotlin.js.JSON
 import kotlin.js.Promise
 
-private const val API_ENDPOINT = "https://localhost:3000/api/generate"
+// The agent runs entirely in the browser: the task pane calls Gemini directly
+// with the user's own API key, so there is no backend to host. The key is kept
+// only in this browser (localStorage) and sent straight to Google.
+private const val GEMINI_MODEL = "gemini-3.1-flash-lite"
+private const val KEY_STORAGE = "googleApiKey"
+
+private val INSTRUCTION = """
+You are an Excel spreadsheet assistant. You work with the user across multiple
+turns: they describe a sheet, you build it, and then they may ask follow-up
+questions to refine, extend, or fix what you already produced.
+
+You respond with a structured JSON object containing two fields:
+- "explanation": a short, friendly summary of what you did this turn.
+- "actions": a list of cell writes, each with a "cell" and a "value".
+
+Rules:
+- "cell" must be a valid A1-style Excel cell reference (e.g. "A1", "B2", "C10").
+- "value" is either literal text/number as a string, or an Excel formula that
+  begins with "=" (e.g. "=SUM(B2:B10)").
+- Build complete, sensible sheets: include headers, sample data rows, and
+  totals/formulas where appropriate.
+- Use relative references inside formulas that match where you place them.
+- FOLLOW-UPS: You can see the full conversation history, including the cells you
+  already wrote. When the user asks for a change, return ONLY the cells that need
+  to be added or overwritten to satisfy the new request — do not re-emit
+  unchanged cells. To clear a cell, set its "value" to an empty string "".
+- If the user only asks a question and no cells need to change, return an empty
+  "actions" list and put the answer in "explanation".
+- Always validate your own output: make sure formulas reference the right ranges
+  and account for edge cases (empty cells, division by zero, mixed data types).
+- IMPORTANT: Always respond with ONLY a valid JSON object — no markdown, no extra
+  text, just the JSON:
+  { "explanation": "...", "actions": [ { "cell": "A1", "value": "..." } ] }
+""".trimIndent()
 
 external val Office: dynamic
 external val Excel: dynamic
@@ -23,6 +58,9 @@ data class ChatMessage(
     val cellCount: Int = 0,
 )
 
+// One turn of Gemini conversation history: role is "user" or "model".
+private data class Turn(val role: String, val text: String)
+
 private data class SuggestionItem(val emoji: String, val label: String, val prompt: String)
 
 private val SUGGESTIONS = listOf(
@@ -33,13 +71,6 @@ private val SUGGESTIONS = listOf(
 
 // ---- Entry point -----------------------------------------------------------
 
-private fun newSessionId(): String {
-    val crypto = window.asDynamic().crypto
-    return if (crypto != null && js("typeof crypto.randomUUID === 'function'") as Boolean)
-        crypto.randomUUID().unsafeCast<String>()
-    else "sess-${js("Date.now()")}-${js("Math.random().toString(16).slice(2)")}"
-}
-
 fun main() {
     // Wait for Office.js to initialise, then render regardless of host so the
     // UI is visible in a plain browser too. Excel-specific calls (applyActions)
@@ -48,11 +79,80 @@ fun main() {
     Office.onReady { renderComposable(rootElementId = "root") { App() } }
 }
 
+// ---- Gemini call -----------------------------------------------------------
+
+private fun geminiPart(text: String): dynamic {
+    val part = js("{}")
+    part.text = text
+    val parts = js("[]")
+    parts.push(part)
+    return parts
+}
+
+private fun geminiTurn(role: String, text: String): dynamic {
+    val turn = js("{}")
+    turn.role = role
+    turn.parts = geminiPart(text)
+    return turn
+}
+
+// Strip a ```json ... ``` code fence if the model adds one despite instructions.
+private fun stripFences(raw: String): String {
+    var t = raw.trim()
+    if (t.startsWith("```")) {
+        val nl = t.indexOf('\n')
+        if (nl >= 0) t = t.substring(nl + 1)
+        if (t.endsWith("```")) t = t.substring(0, t.length - 3)
+    }
+    return t.trim()
+}
+
+/** Calls Gemini with the system prompt + history + new prompt. Returns the raw model text. */
+private suspend fun callGemini(apiKey: String, history: List<Turn>, prompt: String): String {
+    val contents = js("[]")
+    history.forEach { contents.push(geminiTurn(it.role, it.text)) }
+    contents.push(geminiTurn("user", prompt))
+
+    val body = js("{}")
+    body.systemInstruction = js("{}")
+    body.systemInstruction.parts = geminiPart(INSTRUCTION)
+    body.contents = contents
+    body.generationConfig = js("{}")
+    body.generationConfig.responseMimeType = "application/json"
+
+    val opts = js("{}")
+    opts.method = "POST"
+    opts.headers = js("({'Content-Type':'application/json'})")
+    opts.body = JSON.stringify(body)
+
+    val enc = window.asDynamic().encodeURIComponent(apiKey) as String
+    val url = "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent?key=$enc"
+
+    val response = window.asDynamic().fetch(url, opts).unsafeCast<Promise<dynamic>>().await()
+
+    if (response.ok != true) {
+        val err = response.json().unsafeCast<Promise<dynamic>>().await()
+        val msg = err.error?.message as? String
+        throw Exception(
+            msg?.takeIf { it.isNotEmpty() }
+                ?: "Request failed (${response.status}). Check your API key."
+        )
+    }
+
+    val data = response.json().unsafeCast<Promise<dynamic>>().await()
+    val candidates = data.candidates
+    if (!(js("Array.isArray(candidates)") as Boolean) || (candidates.length as Int) == 0)
+        throw Exception("Gemini returned no response.")
+    return (candidates[0].content.parts[0].text as? String) ?: ""
+}
+
 // ---- Root composable -------------------------------------------------------
 
 @Composable
 fun App() {
-    var sessionId by remember { mutableStateOf(newSessionId()) }
+    var apiKey    by remember { mutableStateOf(localStorage.getItem(KEY_STORAGE) ?: "") }
+    var editingKey by remember { mutableStateOf(apiKey.isEmpty()) }
+    var history   by remember { mutableStateOf(listOf<Turn>()) }
     var messages  by remember { mutableStateOf(listOf<ChatMessage>()) }
     var input     by remember { mutableStateOf("") }
     var busy      by remember { mutableStateOf(false) }
@@ -73,6 +173,7 @@ fun App() {
     fun sendTurn() {
         val prompt = input.trim()
         if (prompt.isEmpty() || busy) return
+        if (apiKey.isEmpty()) { editingKey = true; return }
         busy = true
         input = ""
         addMsg(prompt, MsgKind.User)
@@ -80,34 +181,20 @@ fun App() {
 
         scope.launch {
             try {
-                val bodyObj = js("{}")
-                bodyObj.sessionId = sessionId
-                bodyObj.prompt = prompt
-                val fetchOpts = js("{}")
-                fetchOpts.method = "POST"
-                fetchOpts.headers = js("({'Content-Type':'application/json'})")
-                fetchOpts.body = JSON.stringify(bodyObj)
+                val rawText = callGemini(apiKey, history, prompt)
+                val parsed = JSON.parse<dynamic>(stripFences(rawText))
 
-                val response = window.asDynamic()
-                    .fetch(API_ENDPOINT, fetchOpts)
-                    .unsafeCast<Promise<dynamic>>().await()
-
-                if (response.ok != true) {
-                    val err = response.json().unsafeCast<Promise<dynamic>>().await()
-                    throw Exception((err.error as? String)?.takeIf { it.isNotEmpty() }
-                        ?: "Request failed (${response.status}).")
-                }
-
-                val data = response.json().unsafeCast<Promise<dynamic>>().await()
-                val arr = data.actions
+                val arr = parsed.actions
                 val actions: List<dynamic> = if (js("Array.isArray(arr)") as Boolean)
                     (0 until (arr.length as Int)).map { i -> arr[i] }
                 else emptyList()
-                val explanation = (data.explanation as? String)?.takeIf { it.isNotEmpty() } ?: "Done."
+                val explanation = (parsed.explanation as? String)?.takeIf { it.isNotEmpty() } ?: "Done."
 
                 if (actions.isNotEmpty()) applyActions(actions)
                 removeMsg(thinkingId)
                 addMsg(explanation, MsgKind.Assistant, actions.size)
+                // Record the turn (raw model text) so follow-ups see prior cells.
+                history = history + Turn("user", prompt) + Turn("model", rawText)
             } catch (e: Throwable) {
                 removeMsg(thinkingId)
                 addMsg(e.message ?: "Something went wrong.", MsgKind.Error)
@@ -118,19 +205,36 @@ fun App() {
     }
 
     Div({ classes("app") }) {
-        Banner(onNewChat = { sessionId = newSessionId(); messages = emptyList() })
-        Thread(messages, busy, onSuggestion = { s -> input = s.prompt; sendTurn() })
-        Composer(input, busy,
-            onInputChange = { input = it },
-            onSend = { sendTurn() }
+        Banner(
+            hasKey = apiKey.isNotEmpty(),
+            onNewChat = { messages = emptyList(); history = emptyList() },
+            onEditKey = { editingKey = true },
         )
+        if (editingKey) {
+            ApiKeyPanel(
+                initial = apiKey,
+                canCancel = apiKey.isNotEmpty(),
+                onSave = { k ->
+                    apiKey = k
+                    localStorage.setItem(KEY_STORAGE, k)
+                    editingKey = false
+                },
+                onCancel = { editingKey = false },
+            )
+        } else {
+            Thread(messages, busy, onSuggestion = { s -> input = s.prompt; sendTurn() })
+            Composer(input, busy,
+                onInputChange = { input = it },
+                onSend = { sendTurn() }
+            )
+        }
     }
 }
 
 // ---- Components ------------------------------------------------------------
 
 @Composable
-private fun Banner(onNewChat: () -> Unit) {
+private fun Banner(hasKey: Boolean, onNewChat: () -> Unit, onEditKey: () -> Unit) {
     Header({ classes("banner") }) {
         Div({ classes("banner-icon") }) {
             Div({ classes("banner-icon-box") }) { Text("M") }
@@ -141,8 +245,49 @@ private fun Banner(onNewChat: () -> Unit) {
         }
         Button({
             classes("new-chat-btn")
+            onClick { onEditKey() }
+        }) { Text(if (hasKey) "Key" else "Add key") }
+        Button({
+            classes("new-chat-btn")
             onClick { onNewChat() }
         }) { Text("New") }
+    }
+}
+
+@Composable
+private fun ApiKeyPanel(
+    initial: String,
+    canCancel: Boolean,
+    onSave: (String) -> Unit,
+    onCancel: () -> Unit,
+) {
+    var draft by remember { mutableStateOf(initial) }
+    Div({ classes("thread", "mesum-scroll") }) {
+        Div({ classes("empty-state") }) {
+            Div({ classes("empty-title") }) { Text("Add your Google API key") }
+            Div({ classes("empty-sub") }) {
+                Text("Your key is stored only in this browser and used to call Gemini directly. ")
+                A(href = "https://aistudio.google.com/apikey", attrs = { target(ATarget.Blank) }) {
+                    Text("Get a free key")
+                }
+            }
+            Input(InputType.Password) {
+                classes("key-input")
+                value(draft)
+                onInput { draft = it.value }
+                attr("placeholder", "Paste your API key (AIza…)")
+            }
+            Div({ classes("composer-row") }) {
+                if (canCancel) {
+                    Button({ classes("suggestion"); onClick { onCancel() } }) { Text("Cancel") }
+                }
+                Button({
+                    classes("send-btn")
+                    if (draft.trim().isEmpty()) attr("disabled", "disabled")
+                    onClick { onSave(draft.trim()) }
+                }) { Text("Save key") }
+            }
+        }
     }
 }
 
