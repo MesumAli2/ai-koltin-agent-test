@@ -39,10 +39,11 @@ object ExcelAgent {
         name = "excel_ai_agent",
         description = "An Excel spreadsheet assistant that turns natural-language requests into A1-style cell writes and formulas.",
         model = Gemini(
-            name = "gemini-2.0-flash",
+            name = "gemini-3.1-flash-lite",
             apiKey = System.getenv("GOOGLE_API_KEY")
                 ?: error("GOOGLE_API_KEY environment variable not set."),
         ),
         instruction = Instruction(INSTRUCTION),
     )
 }
+

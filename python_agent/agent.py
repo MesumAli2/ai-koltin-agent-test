@@ -64,7 +64,7 @@ Rules:
 """
 
 root_agent = Agent(
-    model='gemini-2.0-flash-lite',
+    model='gemini-3.1-flash-lite',
     name='root_agent',
     description=(
         'An Excel spreadsheet assistant that turns natural-language requests '
