@@ -14,34 +14,64 @@ import kotlin.js.Promise
 // only in this browser (localStorage) and sent straight to Google.
 private const val GEMINI_MODEL = "gemini-3.1-flash-lite"
 private const val KEY_STORAGE = "googleApiKey"
+private const val HISTORY_STORAGE = "chatHistory"
+private const val MESSAGES_STORAGE = "chatMessages"
 
 private val INSTRUCTION = """
-You are an Excel spreadsheet assistant. You work with the user across multiple
-turns: they describe a sheet, you build it, and then they may ask follow-up
-questions to refine, extend, or fix what you already produced.
+You are an Excel spreadsheet assistant running inside Excel via Office.js. You
+work with the user across multiple turns: they describe a sheet, you build it
+live in the active worksheet, and then they refine, extend, or fix it.
 
-You respond with a structured JSON object containing two fields:
+You respond with ONLY a JSON object: { "explanation": "...", "actions": [ ... ] }.
 - "explanation": a short, friendly summary of what you did this turn.
-- "actions": a list of cell writes, each with a "cell" and a "value".
+- "actions": an ordered list. Each action has a "type":
+
+1. "cell" (the default when "type" is omitted) — write a single cell.
+   { "type": "cell", "cell": "B2", "value": "1200", "numberFormat": "#,##0" }
+   - "cell": a valid A1 reference (e.g. "A1", "B2", "C10").
+   - "value": literal text/number as a string, OR a live formula beginning with
+     "=" (e.g. "=SUM(B2:B13)", "=AVERAGE(B2:B13)", "=B2/${'$'}B${'$'}14"). Prefer
+     live formulas over hard-coded results so the sheet recalculates itself.
+   - "numberFormat" (optional): an Excel number-format code for that cell.
+   - To clear a cell, set "value" to an empty string "".
+
+2. "format" — style a range (headers, zebra striping, number formats).
+   { "type": "format", "range": "A1:D1", "fill": "#2C4A5E",
+     "fontColor": "#FFFFFF", "bold": true }
+   { "type": "format", "range": "B2:B13", "numberFormat": "#,##0" }
+   - "range": an A1 range. "fill" / "fontColor": hex colors. "bold": boolean.
+   - "numberFormat": applies to every cell in the range.
+
+3. "chart" — embed a native, reactive chart bound to live cells. It redraws
+   automatically whenever the underlying data changes.
+   { "type": "chart", "chartType": "column", "dataRange": "A1:B13",
+     "title": "Revenue by Month", "position": { "from": "F2", "to": "M20" } }
+   - "chartType": "column" (default), "bar", "line", or "pie".
+   - "dataRange": the range to plot, including the header row/column.
+   - "title" and "position" are optional.
+
+DESIGN DEFAULTS — every layout you build must read like a clean executive report:
+- THEME "Steel Blue": fill the header row #2C4A5E with bold #FFFFFF text. Add
+  zebra striping by filling alternating data rows #F4F7F9 (leave the rest white).
+- NUMBER FORMATS: currency and counts use "#,##0"; percentages use "0.0%".
+  Always attach number formats to numeric columns.
+- FORMULAS: use =SUM, =AVERAGE, etc. for totals and rollups — never paste a
+  computed constant where a formula belongs.
+- CHARTS / TRACKERS: when the user asks for a chart, dashboard, or tracker, add
+  a "chart" action plotting the key series.
+- Column widths are auto-fitted for you after every turn — you needn't set them.
 
 Rules:
-- "cell" must be a valid A1-style Excel cell reference (e.g. "A1", "B2", "C10").
-- "value" is either literal text/number as a string, or an Excel formula that
-  begins with "=" (e.g. "=SUM(B2:B10)").
-- Build complete, sensible sheets: include headers, sample data rows, and
-  totals/formulas where appropriate.
+- Build complete, sensible sheets: headers, sample data rows, totals/formulas.
 - Use relative references inside formulas that match where you place them.
-- FOLLOW-UPS: You can see the full conversation history, including the cells you
-  already wrote. When the user asks for a change, return ONLY the cells that need
-  to be added or overwritten to satisfy the new request — do not re-emit
-  unchanged cells. To clear a cell, set its "value" to an empty string "".
-- If the user only asks a question and no cells need to change, return an empty
+- FOLLOW-UPS: you can see the full conversation history, including the cells and
+  formats you already produced. Return ONLY the actions needed for the new
+  request — do not re-emit unchanged cells.
+- If the user only asks a question and nothing needs to change, return an empty
   "actions" list and put the answer in "explanation".
-- Always validate your own output: make sure formulas reference the right ranges
-  and account for edge cases (empty cells, division by zero, mixed data types).
-- IMPORTANT: Always respond with ONLY a valid JSON object — no markdown, no extra
-  text, just the JSON:
-  { "explanation": "...", "actions": [ { "cell": "A1", "value": "..." } ] }
+- Always validate your output: correct ranges, and handle edge cases (empty
+  cells, division by zero, mixed data types).
+- IMPORTANT: respond with ONLY the JSON object — no markdown, no extra text.
 """.trimIndent()
 
 external val Office: dynamic
@@ -146,18 +176,91 @@ private suspend fun callGemini(apiKey: String, history: List<Turn>, prompt: Stri
     return (candidates[0].content.parts[0].text as? String) ?: ""
 }
 
+// ---- Session persistence ---------------------------------------------------
+// The task pane's iframe can reload at any moment (re-activating the add-in,
+// Excel regaining focus, navigation). Compose state is wiped on reload, which is
+// why the chat "goes blank" and the model loses context. We mirror the
+// conversation to localStorage and restore it on load so the current chat — and
+// the cells/charts it produced — survive reloads. "New" clears it.
+
+private fun saveHistory(history: List<Turn>) {
+    val arr = js("[]")
+    history.forEach { t ->
+        val o = js("{}")
+        o.role = t.role
+        o.text = t.text
+        arr.push(o)
+    }
+    localStorage.setItem(HISTORY_STORAGE, JSON.stringify(arr))
+}
+
+private fun loadHistory(): List<Turn> {
+    val raw = localStorage.getItem(HISTORY_STORAGE) ?: return emptyList()
+    return try {
+        val arr = JSON.parse<dynamic>(raw)
+        if (js("Array.isArray(arr)") as Boolean)
+            (0 until (arr.length as Int)).map { i -> Turn(arr[i].role as String, arr[i].text as String) }
+        else emptyList()
+    } catch (e: Throwable) {
+        emptyList()
+    }
+}
+
+// Transient "Thinking" bubbles are never persisted — they only exist mid-flight.
+private fun saveMessages(messages: List<ChatMessage>) {
+    val arr = js("[]")
+    messages.filter { it.kind != MsgKind.Thinking }.forEach { m ->
+        val o = js("{}")
+        o.id = m.id
+        o.text = m.text
+        o.kind = m.kind.name
+        o.cellCount = m.cellCount
+        arr.push(o)
+    }
+    localStorage.setItem(MESSAGES_STORAGE, JSON.stringify(arr))
+}
+
+private fun loadMessages(): List<ChatMessage> {
+    val raw = localStorage.getItem(MESSAGES_STORAGE) ?: return emptyList()
+    return try {
+        val arr = JSON.parse<dynamic>(raw)
+        if (js("Array.isArray(arr)") as Boolean)
+            (0 until (arr.length as Int)).map { i ->
+                val o = arr[i]
+                ChatMessage(
+                    id = (o.id as Number).toInt(),
+                    text = o.text as String,
+                    kind = MsgKind.valueOf(o.kind as String),
+                    cellCount = (o.cellCount as? Number)?.toInt() ?: 0,
+                )
+            }
+        else emptyList()
+    } catch (e: Throwable) {
+        emptyList()
+    }
+}
+
+private fun clearSession() {
+    localStorage.removeItem(HISTORY_STORAGE)
+    localStorage.removeItem(MESSAGES_STORAGE)
+}
+
 // ---- Root composable -------------------------------------------------------
 
 @Composable
 fun App() {
     var apiKey    by remember { mutableStateOf(localStorage.getItem(KEY_STORAGE) ?: "") }
     var editingKey by remember { mutableStateOf(apiKey.isEmpty()) }
-    var history   by remember { mutableStateOf(listOf<Turn>()) }
-    var messages  by remember { mutableStateOf(listOf<ChatMessage>()) }
+    var history   by remember { mutableStateOf(loadHistory()) }
+    var messages  by remember { mutableStateOf(loadMessages()) }
     var input     by remember { mutableStateOf("") }
     var busy      by remember { mutableStateOf(false) }
-    var nextId    by remember { mutableStateOf(0) }
+    var nextId    by remember { mutableStateOf((messages.maxOfOrNull { it.id } ?: -1) + 1) }
     val scope = rememberCoroutineScope()
+
+    // Mirror the conversation to localStorage whenever it changes.
+    LaunchedEffect(history)  { saveHistory(history) }
+    LaunchedEffect(messages) { saveMessages(messages) }
 
     fun addMsg(text: String, kind: MsgKind, cellCount: Int = 0): Int {
         val id = nextId++
@@ -190,11 +293,19 @@ fun App() {
                 else emptyList()
                 val explanation = (parsed.explanation as? String)?.takeIf { it.isNotEmpty() } ?: "Done."
 
+                // Commit and PERSIST the assistant reply BEFORE writing to Excel.
+                // Adding a chart can force the task-pane iframe to reload, aborting
+                // this coroutine mid-flight; if we wrote the reply after applyActions
+                // it would be lost, leaving the bubble missing after the reload.
+                val updatedMessages = messages.filter { it.id != thinkingId } +
+                    ChatMessage(nextId++, explanation, MsgKind.Assistant, actions.size)
+                val updatedHistory = history + Turn("user", prompt) + Turn("model", rawText)
+                messages = updatedMessages
+                history = updatedHistory
+                saveMessages(updatedMessages)
+                saveHistory(updatedHistory)
+
                 if (actions.isNotEmpty()) applyActions(actions)
-                removeMsg(thinkingId)
-                addMsg(explanation, MsgKind.Assistant, actions.size)
-                // Record the turn (raw model text) so follow-ups see prior cells.
-                history = history + Turn("user", prompt) + Turn("model", rawText)
             } catch (e: Throwable) {
                 removeMsg(thinkingId)
                 addMsg(e.message ?: "Something went wrong.", MsgKind.Error)
@@ -207,7 +318,7 @@ fun App() {
     Div({ classes("app") }) {
         Banner(
             hasKey = apiKey.isNotEmpty(),
-            onNewChat = { messages = emptyList(); history = emptyList() },
+            onNewChat = { messages = emptyList(); history = emptyList(); clearSession() },
             onEditKey = { editingKey = true },
         )
         if (editingKey) {
@@ -311,7 +422,7 @@ private fun MessageBubble(msg: ChatMessage) {
             Text(msg.text)
             if (msg.cellCount > 0) {
                 Div({ classes("meta") }) {
-                    Text("Wrote ${msg.cellCount} cell${if (msg.cellCount == 1) "" else "s"} to the sheet.")
+                    Text("Applied ${msg.cellCount} update${if (msg.cellCount == 1) "" else "s"} to the sheet.")
                 }
             }
         }
@@ -383,17 +494,92 @@ private fun Composer(
 
 // ---- Excel interop ---------------------------------------------------------
 
+/** Maps a model "chartType" string to an Office.js chart type (defaults to columns). */
+private fun chartType(name: String?): dynamic = when (name?.lowercase()) {
+    "bar"  -> Excel.ChartType.barClustered
+    "line" -> Excel.ChartType.line
+    "pie"  -> Excel.ChartType.pie
+    else   -> Excel.ChartType.columnClustered
+}
+
+/** "A" -> 1, "B" -> 2, ... "AA" -> 27. */
+private fun colToNum(letters: String): Int {
+    var n = 0
+    for (c in letters) n = n * 26 + (c.uppercaseChar() - 'A' + 1)
+    return n
+}
+
+/**
+ * Derives a range's (rows, cols) purely from its A1 address — no round-trip to
+ * Excel needed — so we can build a correctly sized numberFormat matrix in one
+ * batch. "B2:B13" -> (12, 1); a bare "B2" -> (1, 1).
+ */
+private fun rangeDims(a1: String): Pair<Int, Int> {
+    val clean = a1.substringAfterLast('!').replace("$", "").trim()
+    fun rc(ref: String): Pair<Int, Int> {
+        val col = ref.takeWhile { it.isLetter() }
+        val row = ref.dropWhile { it.isLetter() }
+        return (row.toIntOrNull() ?: 1) to colToNum(col.ifEmpty { "A" })
+    }
+    val parts = clean.split(":")
+    if (parts.size < 2) return 1 to 1
+    val (r1, c1) = rc(parts[0])
+    val (r2, c2) = rc(parts[1])
+    return (kotlin.math.abs(r2 - r1) + 1) to (kotlin.math.abs(c2 - c1) + 1)
+}
+
+/** A rows×cols matrix every entry of which is [fmt], for Range.numberFormat. */
+private fun formatMatrix(rows: Int, cols: Int, fmt: String): Array<Array<String>> =
+    Array(rows) { Array(cols) { fmt } }
+
+private fun applyCell(sheet: dynamic, action: dynamic) {
+    val cell = action.cell as? String ?: return
+    val range = sheet.getRange(cell)
+    val value = action.value
+    if (value is String && value.trim().startsWith("="))
+        range.formulas = arrayOf(arrayOf(value))
+    else
+        range.values = arrayOf(arrayOf(value))
+    (action.numberFormat as? String)?.let { range.numberFormat = arrayOf(arrayOf(it)) }
+}
+
+private fun applyFormat(sheet: dynamic, action: dynamic) {
+    val addr = action.range as? String ?: return
+    val range = sheet.getRange(addr)
+    (action.fill as? String)?.let { range.format.fill.color = it }
+    (action.fontColor as? String)?.let { range.format.font.color = it }
+    (action.bold as? Boolean)?.let { range.format.font.bold = it }
+    (action.numberFormat as? String)?.let { fmt ->
+        val (rows, cols) = rangeDims(addr)
+        range.numberFormat = formatMatrix(rows, cols, fmt)
+    }
+}
+
+private fun applyChart(sheet: dynamic, action: dynamic) {
+    val dataAddr = action.dataRange as? String ?: return
+    val chart = sheet.charts.add(
+        chartType(action.chartType as? String),
+        sheet.getRange(dataAddr),
+        Excel.ChartSeriesBy.auto,
+    )
+    (action.title as? String)?.let { chart.title.text = it }
+    val pos = action.position
+    if (pos != null) {
+        val from = pos.from as? String
+        val to = pos.to as? String
+        if (from != null && to != null) chart.setPosition(from, to)
+    }
+}
+
 private suspend fun applyActions(actions: List<dynamic>) {
     Excel.run { context: dynamic ->
         val sheet = context.workbook.worksheets.getActiveWorksheet()
         actions.forEach { action ->
-            val cell = action.cell as? String ?: return@forEach
-            val range = sheet.getRange(cell)
-            val value = action.value
-            if (value is String && value.trim().startsWith("="))
-                range.formulas = arrayOf(arrayOf(value))
-            else
-                range.values = arrayOf(arrayOf(value))
+            when ((action.type as? String) ?: "cell") {
+                "format" -> applyFormat(sheet, action)
+                "chart"  -> applyChart(sheet, action)
+                else     -> applyCell(sheet, action)
+            }
         }
         sheet.getUsedRange().format.autofitColumns()
         context.sync()
